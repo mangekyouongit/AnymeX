@@ -1,5 +1,7 @@
 name: Android build (personal)
 on:
+  push:
+    branches: [cast-fixes]
   workflow_dispatch:
 
 jobs:
