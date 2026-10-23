@@ -149,7 +149,12 @@ class _CastDeviceDialogState extends State<CastDeviceDialog> {
               min: 0,
               value: currentPosMs,
               max: maxDurationMs,
+              onChangeStart: (_) => castService.scrubbing = true,
               onChanged: (val) {
+                castService.castPosition.value = Duration(milliseconds: val.round());
+              },
+              onChangeEnd: (val) {
+                castService.scrubbing = false;
                 castService.seek(Duration(milliseconds: val.round()));
               },
             ),
@@ -301,7 +306,10 @@ class _CastDeviceDialogState extends State<CastDeviceDialog> {
   }
 
   Future<void> _handleDeviceTap(CastDevice device) async {
-    final videoUrl = widget.controller.selectedVideo.value?.url ?? widget.controller.offlineVideoPath;
+    final resolvedUrl = widget.controller.activeStreamUrl;
+    final videoUrl = (resolvedUrl != null && resolvedUrl.isNotEmpty)
+        ? resolvedUrl
+        : widget.controller.selectedVideo.value?.url ?? widget.controller.offlineVideoPath;
     final headers = widget.controller.selectedVideo.value?.headers;
     if (videoUrl == null || videoUrl.isEmpty) return;
 

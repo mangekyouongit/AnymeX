@@ -193,6 +193,7 @@ class PlayerController extends GetxController with WidgetsBindingObserver {
   double _sessionSpeed = 1.0;
   final RxBool isBuffering = false.obs;
   bool _isTorrentBuffering = false;
+  String? activeStreamUrl;
   final RxBool isPlaying = false.obs;
   final RxBool showControls = true.obs;
   final RxBool isSeeking = false.obs;
@@ -1106,6 +1107,7 @@ class PlayerController extends GetxController with WidgetsBindingObserver {
       }
     }
 
+    activeStreamUrl = url;
     await _basePlayer.open(url, headers: headers, startPosition: startPosition);
     await _basePlayer.setRate(_sessionSpeed);
   }
@@ -1979,6 +1981,7 @@ class PlayerController extends GetxController with WidgetsBindingObserver {
       }
     }
 
+    activeStreamUrl = url;
     await _basePlayer.open(url, headers: headers, startPosition: startPosition);
     await _basePlayer.setRate(_sessionSpeed);
     _autoSelectAudioTrack();

@@ -26,6 +26,9 @@ class CastV2Client {
   final SecureSocket _socket;
   final String sessionId;
   String? _transportId;
+  String? _targetAppId;
+  Completer<String>? _appCompleter;
+  Timer? _heartbeatTimer;
   int _requestId = 1;
 
   final _messageController = StreamController<Map<String, dynamic>>.broadcast();
@@ -54,8 +57,34 @@ class CastV2Client {
       destinationId: 'receiver-0',
       payload: {'type': 'CONNECT'},
     );
+    client._startHeartbeat();
 
     return client;
+  }
+
+  void _startHeartbeat() {
+    _heartbeatTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+      try {
+        sendMessage(
+          namespace: kNamespaceHeartbeat,
+          destinationId: 'receiver-0',
+          payload: {'type': 'PING'},
+        );
+      } catch (_) {
+        close();
+      }
+    });
+  }
+
+  Future<String> launchApp(String appId, {Duration timeout = const Duration(seconds: 10)}) {
+    _targetAppId = appId;
+    final completer = Completer<String>();
+    _appCompleter = completer;
+    sendMessage(
+      namespace: kNamespaceReceiver,
+      payload: {'type': 'LAUNCH', 'appId': appId},
+    );
+    return completer.future.timeout(timeout);
   }
 
   void _onData(List<int> chunk) {
@@ -95,11 +124,13 @@ class CastV2Client {
 
     if (msg.namespace == kNamespaceReceiver && type == 'RECEIVER_STATUS') {
       final status = msg.payload['status'] as Map<String, dynamic>?;
-      final applications = status?['applications'] as List<dynamic>?;
-      if (applications != null && applications.isNotEmpty) {
-        final app = applications.first as Map<String, dynamic>;
+      final applications = (status?['applications'] as List<dynamic>?) ?? const [];
+      for (final entry in applications) {
+        final app = entry as Map<String, dynamic>;
+        if (_targetAppId != null && app['appId'] != _targetAppId) continue;
         final newTransportId = app['transportId'] as String?;
-        if (newTransportId != null && newTransportId != _transportId) {
+        if (newTransportId == null) continue;
+        if (newTransportId != _transportId) {
           _transportId = newTransportId;
           sendMessage(
             namespace: kNamespaceConnection,
@@ -107,6 +138,11 @@ class CastV2Client {
             payload: {'type': 'CONNECT'},
           );
         }
+        final completer = _appCompleter;
+        if (completer != null && !completer.isCompleted) {
+          completer.complete(newTransportId);
+        }
+        break;
       }
     }
 
@@ -124,7 +160,8 @@ class CastV2Client {
       payload['requestId'] = _requestId++;
     }
 
-    final dest = destinationId ?? _transportId ?? 'receiver-0';
+    final dest = destinationId ??
+        (namespace == kNamespaceReceiver ? 'receiver-0' : (_transportId ?? 'receiver-0'));
     final payloadJson = jsonEncode(payload);
 
     final encodedProto = _encodeCastMessage(
@@ -248,6 +285,8 @@ class CastV2Client {
   }
 
   Future<void> close() async {
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = null;
     if (!_stateController.isClosed) {
       _stateController.add(false);
       _stateController.close();

@@ -47,6 +47,7 @@ class CastService extends GetxController {
   final RxBool isPlaying = true.obs;
   final Rx<Duration> castPosition = Duration.zero.obs;
   final Rx<Duration> castDuration = Duration.zero.obs;
+  bool scrubbing = false;
 
   dlna_pkg.DLNAManager? _dlnaManager;
   dlna_pkg.DLNADevice? _activeDlnaDevice;
@@ -113,44 +114,63 @@ class CastService extends GetxController {
       _mdnsSocket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
       _mdnsSocket!.broadcastEnabled = true;
 
+      final socket = _mdnsSocket!;
       final mdnsQuery = _buildMdnsQuery('_googlecast._tcp.local');
-      _mdnsSocket!.send(mdnsQuery, InternetAddress('224.0.0.251'), 5353);
 
-      _mdnsSocket!.listen((event) {
+      socket.listen((event) {
         if (event == RawSocketEvent.read) {
-          final datagram = _mdnsSocket?.receive();
+          final datagram = socket.receive();
           if (datagram != null) {
             final host = datagram.address.address;
             final text = String.fromCharCodes(datagram.data);
             if (text.contains('googlecast') || text.contains('Chromecast') || text.contains('Google Cast')) {
-              final friendlyName = _extractMdnsName(text, 'Chromecast ($host)');
-              final device = CastDevice(
+              final fallbackName = 'Chromecast ($host)';
+              final friendlyName = _extractMdnsName(datagram.data, fallbackName);
+              final alreadyKnown = discoveredDevices.any(
+                (d) => d.host == host && d.protocol == CastProtocol.chromecast,
+              );
+              if (alreadyKnown && friendlyName == fallbackName) return;
+              _addDiscoveredDevice(CastDevice(
                 id: 'chromecast-$host-8009',
                 name: friendlyName,
                 host: host,
                 port: 8009,
                 protocol: CastProtocol.chromecast,
-              );
-              _addDiscoveredDevice(device);
+              ));
             }
           }
         }
       });
+
+      for (var i = 0; i < 3; i++) {
+        if (i > 0) await Future.delayed(const Duration(seconds: 1));
+        if (!identical(socket, _mdnsSocket)) return;
+        socket.send(mdnsQuery, InternetAddress('224.0.0.251'), 5353);
+      }
     } catch (_) {}
   }
 
-  String _extractMdnsName(String raw, String defaultName) {
-    final fnMatch = RegExp(r'fn=([^\x00-\x1f\r\n]+)').firstMatch(raw);
-    if (fnMatch != null && fnMatch.group(1) != null) {
-      final name = fnMatch.group(1)!.trim();
-      if (name.isNotEmpty) return name;
+  String _extractMdnsName(List<int> data, String defaultName) {
+    return _extractTxtValue(data, 'fn') ?? _extractTxtValue(data, 'md') ?? defaultName;
+  }
+
+  String? _extractTxtValue(List<int> data, String key) {
+    final needle = utf8.encode('$key=');
+    for (var i = 1; i <= data.length - needle.length; i++) {
+      var match = true;
+      for (var j = 0; j < needle.length; j++) {
+        if (data[i + j] != needle[j]) {
+          match = false;
+          break;
+        }
+      }
+      if (!match) continue;
+      final len = data[i - 1];
+      if (len < needle.length || i + len > data.length) continue;
+      final value = utf8.decode(data.sublist(i + needle.length, i + len), allowMalformed: true).trim();
+      if (value.isNotEmpty) return value;
     }
-    final mdMatch = RegExp(r'md=([^\x00-\x1f\r\n]+)').firstMatch(raw);
-    if (mdMatch != null && mdMatch.group(1) != null) {
-      final model = mdMatch.group(1)!.trim();
-      if (model.isNotEmpty) return model;
-    }
-    return defaultName;
+    return null;
   }
 
   List<int> _buildMdnsQuery(String serviceName) {
@@ -310,6 +330,7 @@ class CastService extends GetxController {
           subtitleLabel: subtitleLabel,
           title: mediaTitle,
           isHls: isHls,
+          contentUrl: videoUrl,
           startPosition: startPosition,
         );
       } else if (device.protocol == CastProtocol.dlna) {
@@ -344,6 +365,7 @@ class CastService extends GetxController {
     String? subtitleLabel,
     required String title,
     required bool isHls,
+    required String contentUrl,
     Duration? startPosition,
   }) async {
     await _cleanupChromecast();
@@ -358,17 +380,26 @@ class CastService extends GetxController {
     });
 
     _castMessageSubscription = client.messageStream.listen((msg) {
-      if (msg['type'] == 'MEDIA_STATUS') {
+      final msgType = msg['type'];
+      if (msgType == 'LOAD_FAILED' || msgType == 'LOAD_CANCELLED' || msgType == 'INVALID_REQUEST') {
+        stopCasting();
+        return;
+      }
+      if (msgType == 'MEDIA_STATUS') {
         final statuses = msg['status'] as List<dynamic>?;
         if (statuses != null && statuses.isNotEmpty) {
           final first = statuses.first as Map<String, dynamic>;
           _chromecastMediaSessionId = first['mediaSessionId'] as int?;
           final stateStr = first['playerState'] as String?;
+          if (stateStr == 'IDLE' && first['idleReason'] == 'ERROR') {
+            stopCasting();
+            return;
+          }
           if (stateStr != null) {
             isPlaying.value = stateStr == 'PLAYING' || stateStr == 'BUFFERING';
           }
           final currentSec = (first['currentTime'] as num?)?.toDouble();
-          if (currentSec != null) {
+          if (currentSec != null && !scrubbing) {
             castPosition.value = Duration(milliseconds: (currentSec * 1000).round());
           }
           final mediaInfo = first['media'] as Map<String, dynamic>?;
@@ -380,16 +411,7 @@ class CastService extends GetxController {
       }
     });
 
-    client.sendMessage(
-      namespace: CastV2Client.kNamespaceReceiver,
-      payload: {
-        'type': 'LAUNCH',
-        'appId': 'CC1AD845',
-        'requestId': 1,
-      },
-    );
-
-    await Future.delayed(const Duration(milliseconds: 1200));
+    await client.launchApp('CC1AD845');
 
     final tracks = <Map<String, dynamic>>[];
     final activeTrackIds = <int>[];
@@ -416,7 +438,7 @@ class CastService extends GetxController {
         'currentTime': startSeconds,
         'media': {
           'contentId': mediaUrl,
-          'contentType': isHls ? 'application/x-mpegURL' : 'video/mp4',
+          'contentType': isHls ? 'application/x-mpegURL' : _videoMimeType(contentUrl),
           'streamType': 'BUFFERED',
           'metadata': {
             'type': 0,
@@ -429,6 +451,31 @@ class CastService extends GetxController {
         'requestId': 2,
       },
     );
+
+    _startChromecastStatusPolling(client);
+  }
+
+  void _startChromecastStatusPolling(CastV2Client client) {
+    _positionPollTimer?.cancel();
+    _positionPollTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!identical(client, _castClient)) return;
+      try {
+        client.sendMessage(
+          namespace: CastV2Client.kNamespaceMedia,
+          payload: {
+            'type': 'GET_STATUS',
+            if (_chromecastMediaSessionId != null) 'mediaSessionId': _chromecastMediaSessionId,
+          },
+        );
+      } catch (_) {}
+    });
+  }
+
+  String _videoMimeType(String url) {
+    final path = (Uri.tryParse(url)?.path ?? url).toLowerCase();
+    if (path.endsWith('.mkv')) return 'video/x-matroska';
+    if (path.endsWith('.webm')) return 'video/webm';
+    return 'video/mp4';
   }
 
   Future<void> _castDlna({
